@@ -246,11 +246,6 @@ static struct argp_option options[] = {
     {"avro", 'v', 0, 0,  "Dump apache avro format data file. By default, dump sql command sequence.", 2},
     {"start-time",    'S', "START_TIME",  0,  "Start time to dump. Either epoch or ISO8601/RFC3339 format is acceptable. ISO8601 format example: 2017-10-01T00:00:00.000+0800 or 2017-10-0100:00:00:000+0800 or '2017-10-01 00:00:00.000+0800'",  4},
     {"end-time",      'E', "END_TIME",    0,  "End time to dump. Either epoch or ISO8601/RFC3339 format is acceptable. ISO8601 format example: 2017-10-01T00:00:00.000+0800 or 2017-10-0100:00:00.000+0800 or '2017-10-01 00:00:00.000+0800'",  5},
-#if TSDB_SUPPORT_NANOSECOND == 1
-    {"precision",  'C', "PRECISION",  0,  "Specify precision for converting human-readable time to epoch. Valid value is one of ms, us, and ns. Default is ms.", 6},
-#else
-    {"precision",  'C', "PRECISION",  0,  "Use specified precision to convert human-readable time. Valid value is one of ms and us. Default is ms.", 6},
-#endif
     {"data-batch",  'B', "DATA_BATCH",  0,  "Number of data point per insert statement. Max value is 32766. Default is 1.", 3},
     {"max-sql-len", 'L', "SQL_LEN",     0,  "Max length of one sql. Default is 65480.",   3},
     {"table-batch", 't', "TABLE_BATCH", 0,  "Number of table dumpout into one output file. Default is 1.",  3},
@@ -296,6 +291,8 @@ typedef struct arguments {
     bool      debug_print;
     bool      verbose_print;
     bool      performance_print;
+
+    int         dbCount;
 } SArguments;
 
 /* Our argp parser. */
@@ -364,7 +361,8 @@ struct arguments g_args = {
     false,      // isDumpIn
     false,      // debug_print
     false,      // verbose_print
-    false       // performance_print
+    false,      // performance_print
+        0,      // dbCount
 };
 
 static void errorPrintReqArg2(char *program, char *wrong_arg)
@@ -477,8 +475,6 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
         case 'E':
             g_args.end_time = atol(arg);
             break;
-        case 'C':
-            break;
         case 'B':
             g_args.data_batch = atoi(arg);
             if (g_args.data_batch > MAX_RECORDS_PER_REQ) {
@@ -550,7 +546,7 @@ static int queryDbImpl(TAOS *taos, char *command) {
     return 0;
 }
 
-static void parse_precision_first(
+UNUSED_FUNC static void parse_precision_first(
         int argc, char *argv[], SArguments *arguments) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-C") == 0) {
@@ -682,7 +678,7 @@ int main(int argc, char *argv[]) {
     /* Parse our arguments; every option seen by parse_opt will be
        reflected in arguments. */
     if (argc > 1) {
-        parse_precision_first(argc, argv, &g_args);
+//        parse_precision_first(argc, argv, &g_args);
         parse_timestamp(argc, argv, &g_args);
         parse_args(argc, argv, &g_args);
     }
@@ -816,7 +812,8 @@ int main(int argc, char *argv[]) {
 
 static void taosFreeDbInfos() {
     if (g_dbInfos == NULL) return;
-    for (int i = 0; i < 128; i++) tfree(g_dbInfos[i]);
+    for (int i = 0; i < g_args.dbCount; i++)
+        tfree(g_dbInfos[i]);
     tfree(g_dbInfos);
 }
 
@@ -1046,6 +1043,88 @@ static int32_t taosSaveTableOfMetricToTempFile(
     return 0;
 }
 
+static int getDbCount()
+{
+    int count;
+
+    TAOS     *taos = NULL;
+    TAOS_RES *result     = NULL;
+    char     *command    = NULL;
+    TAOS_ROW row;
+
+    command = (char *)malloc(COMMAND_SIZE);
+    if (command == NULL) {
+        errorPrint("%s() LN%d, failed to allocate command buffer\n", __func__, __LINE__);
+        return 0;
+    }
+
+    /* Connect to server */
+    taos = taos_connect(g_args.host, g_args.user, g_args.password,
+            NULL, g_args.port);
+    if (NULL == taos) {
+        errorPrint("Failed to connect to TDengine server %s\n", g_args.host);
+        free(command);
+        return 0;
+    }
+
+    sprintf(command, "show databases");
+    result = taos_query(taos, command);
+    int32_t code = taos_errno(result);
+
+    if (0 != code) {
+        errorPrint("%s() LN%d, failed to run command: %s, reason: %s\n",
+                __func__, __LINE__, command, taos_errstr(result));
+        free(command);
+        return 0;
+    }
+
+    TAOS_FIELD *fields = taos_fetch_fields(result);
+
+    while ((row = taos_fetch_row(result)) != NULL) {
+        // sys database name : 'log', but subsequent version changed to 'log'
+        if ((strncasecmp(row[TSDB_SHOW_DB_NAME_INDEX], "log",
+                        fields[TSDB_SHOW_DB_NAME_INDEX].bytes) == 0)
+                && (!g_args.allow_sys)) {
+            continue;
+        }
+
+        if (g_args.databases) {  // input multi dbs
+            for (int i = 0; g_args.arg_list[i]; i++) {
+                if (strncasecmp(g_args.arg_list[i],
+                            (char *)row[TSDB_SHOW_DB_NAME_INDEX],
+                            fields[TSDB_SHOW_DB_NAME_INDEX].bytes) == 0)
+                    goto _dump_db_point;
+            }
+            continue;
+        } else if (!g_args.all_databases) {  // only input one db
+            if (strncasecmp(g_args.arg_list[0],
+                        (char *)row[TSDB_SHOW_DB_NAME_INDEX],
+                        fields[TSDB_SHOW_DB_NAME_INDEX].bytes) == 0)
+                goto _dump_db_point;
+            else
+                continue;
+        }
+
+_dump_db_point:
+
+        count++;
+
+        if (g_args.databases) {
+            if (count > g_args.arg_list_len) break;
+
+        } else if (!g_args.all_databases) {
+            if (count >= 1) break;
+        }
+    }
+
+    if (count == 0) {
+        errorPrint("%d databases valid to dump\n", count);
+    }
+
+    free(command);
+    return count;
+}
+
 static int taosDumpOut() {
     TAOS     *taos       = NULL;
     TAOS_RES *result     = NULL;
@@ -1070,7 +1149,14 @@ static int taosDumpOut() {
         return -1;
     }
 
-    g_dbInfos = (SDbInfo **)calloc(128, sizeof(SDbInfo *));
+    g_args.dbCount = getDbCount();
+
+    if (0 == g_args.dbCount) {
+        errorPrint("%d databases valid to dump\n", g_args.dbCount);
+        return -1;
+    }
+
+    g_dbInfos = (SDbInfo **)calloc(g_args.dbCount, sizeof(SDbInfo *));
     if (g_dbInfos == NULL) {
         errorPrint("%s() LN%d, failed to allocate memory\n",
                 __func__, __LINE__);
@@ -1165,9 +1251,9 @@ _dump_db_point:
             g_dbInfos[count]->comp = (int8_t)(*((int8_t *)row[TSDB_SHOW_DB_COMP_INDEX]));
             g_dbInfos[count]->cachelast = (int8_t)(*((int8_t *)row[TSDB_SHOW_DB_CACHELAST_INDEX]));
 
-            tstrncpy(g_dbInfos[count]->precision, (char *)row[TSDB_SHOW_DB_PRECISION_INDEX],
-                    min(8, fields[TSDB_SHOW_DB_PRECISION_INDEX].bytes + 1));
-            //g_dbInfos[count]->precision = *((int8_t *)row[TSDB_SHOW_DB_PRECISION_INDEX]);
+            tstrncpy(g_dbInfos[count]->precision,
+                    (char *)row[TSDB_SHOW_DB_PRECISION_INDEX],
+                    DB_PRECISION_LEN);
             g_dbInfos[count]->update = *((int8_t *)row[TSDB_SHOW_DB_UPDATE_INDEX]);
         }
         count++;
